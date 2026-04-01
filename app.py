@@ -298,8 +298,14 @@ async def run_job(job_id, job_data):
                 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
             else:
-                 jobs[job_id]['status'] = 'failed'
-                 jobs[job_id]['logs'].append("No metadata file generated.")
+                 # skip-analysis mode: no metadata, look for output video directly
+                 mp4_files = glob.glob(os.path.join(output_dir, "*.mp4"))
+                 if mp4_files:
+                     clips = [{'video_url': f"/videos/{job_id}/{os.path.basename(f)}"} for f in mp4_files]
+                     jobs[job_id]['result'] = {'clips': clips}
+                 else:
+                     jobs[job_id]['status'] = 'failed'
+                     jobs[job_id]['logs'].append("No output files generated.")
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
@@ -312,40 +318,53 @@ async def run_job(job_id, job_data):
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    path: Optional[str] = Form(None),
+    skip_analysis: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-    
+
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
-    
-    if not url and not file:
-        raise HTTPException(status_code=400, detail="Must provide URL or File")
+        path = body.get("path", path)
+        skip_analysis = body.get("skip_analysis", skip_analysis)
+
+    # Gemini key only required when NOT skipping analysis
+    is_skip = str(skip_analysis).lower() in ("true", "1", "yes") if skip_analysis else False
+    if not is_skip and not api_key:
+        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header (required unless skip_analysis=true)")
+
+    if not url and not file and not path:
+        raise HTTPException(status_code=400, detail="Must provide URL, File or Path")
 
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
-    
+
     # Prepare Command
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
-    
-    if url:
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key # Override with key from request
+
+    if path:
+        # Local file path (accessible via volume mount)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail=f"Local file not found: {path}")
+        cmd.extend(["-i", path])
+    elif url:
         cmd.extend(["-u", url])
     else:
         # Save uploaded file with size limit check
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-        
+
         # Read file in chunks to check size
         size = 0
         limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-        
+
         with open(input_path, "wb") as buffer:
             while content := await file.read(1024 * 1024): # Read 1MB chunks
                 size += len(content)
@@ -354,10 +373,15 @@ async def process_endpoint(
                     shutil.rmtree(job_output_dir)
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 buffer.write(content)
-                
+
         cmd.extend(["-i", input_path])
 
-    cmd.extend(["-o", job_output_dir])
+    if is_skip:
+        cmd.append("--skip-analysis")
+        # skip-analysis mode expects -o to be a file path, not a directory
+        cmd.extend(["-o", os.path.join(job_output_dir, "output_vertical.mp4")])
+    else:
+        cmd.extend(["-o", job_output_dir])
 
     # Enqueue Job
     jobs[job_id] = {
